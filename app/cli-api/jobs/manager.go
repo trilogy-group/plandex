@@ -40,7 +40,7 @@ func NewManager(cfg *config.Config) *Manager {
 		webhookSender: webhooks.NewSender(cfg),
 		ctx:           ctx,
 		cancel:        cancel,
-		executor:      executor.NewCLIExecutor(cfg.CLI.WorkingDir, cfg.CLI.ProjectPath),
+		executor:      executor.NewCLIExecutor(cfg.CLI.WorkingDir, cfg.CLI.ProjectPath, cfg.CLI.APIKeys, cfg.CLI.Environment),
 	}
 
 	// Start cleanup routine
@@ -63,7 +63,7 @@ func (m *Manager) CreateJob(req *JobRequest) (*Job, error) {
 		CreatedAt:  time.Now(),
 		Metadata:   req.Metadata,
 		WebhookURL: req.WebhookURL,
-		TTL:        m.config.Jobs.DefaultTTL.Duration,
+		TTL:        m.config.Jobs.DefaultTTL,
 	}
 
 	if req.TTL != nil {
@@ -284,7 +284,7 @@ func (m *Manager) validateCommand(command string) error {
 
 // cleanupRoutine periodically cleans up expired jobs
 func (m *Manager) cleanupRoutine() {
-	ticker := time.NewTicker(m.config.Jobs.CleanupInterval.Duration)
+	ticker := time.NewTicker(m.config.Jobs.CleanupInterval)
 	defer ticker.Stop()
 
 	for {

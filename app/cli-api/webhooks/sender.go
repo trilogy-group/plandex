@@ -53,7 +53,7 @@ func (s *Sender) Send(url string, update *JobStatusUpdate) {
 				attempt+1, update.JobID, err)
 
 			if attempt < s.config.Webhooks.MaxRetries {
-				time.Sleep(s.config.Webhooks.RetryBackoff.Duration * time.Duration(attempt+1))
+				time.Sleep(s.config.Webhooks.RetryBackoff * time.Duration(attempt+1))
 				continue
 			}
 

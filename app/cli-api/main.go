@@ -4,61 +4,70 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"os"
-	"os/signal"
-	"syscall"
 
 	"plandex-cli-api/config"
 	"plandex-cli-api/server"
 )
 
-var (
-	configPath = flag.String("config", "", "Path to configuration file")
-	port       = flag.Int("port", 8080, "Port to run API server on")
-	help       = flag.Bool("help", false, "Show help message")
-)
-
 func main() {
+	var configPath = flag.String("config", "plandex-api.json", "Path to configuration file")
+	var port = flag.Int("port", 8080, "Port to run API server on")
+	var help = flag.Bool("help", false, "Show help message")
 	flag.Parse()
 
 	if *help {
 		fmt.Println("Plandex CLI API Wrapper")
 		fmt.Println("Usage: plandex-cli-api [options]")
-		fmt.Println("\nOptions:")
+		fmt.Println()
+		fmt.Println("Options:")
 		flag.PrintDefaults()
-		os.Exit(0)
+		fmt.Println()
+		fmt.Println("Example config file:")
+		fmt.Println(`{
+  "server": {
+    "port": 8080,
+    "host": "0.0.0.0"
+  },
+  "auth": {
+    "api_keys": ["your-api-key-here"],
+    "require_auth": true
+  },
+  "cli": {
+    "auto_detect_stl": true,
+    "api_keys": {
+      "OPENAI_API_KEY": "your-openai-api-key-here"
+    }
+  },
+  "webhooks": {
+    "enabled": true
+  }
+}`)
+		return
 	}
 
 	// Load configuration
-	cfg, err := config.Load(*configPath)
+	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
-		log.Fatalf("Failed to load configuration: %v", err)
+		log.Fatalf("Error loading config: %v", err)
 	}
 
-	// Override port from command line if provided
+	// Override port if specified
 	if *port != 8080 {
 		cfg.Server.Port = *port
 	}
 
-	// Initialize server
-	srv, err := server.New(cfg)
-	if err != nil {
-		log.Fatalf("Failed to initialize server: %v", err)
+	log.Printf("Starting Plandex CLI API server on port %d", cfg.Server.Port)
+	log.Printf("Working directory: %s", cfg.CLI.WorkingDir)
+	if cfg.CLI.AutoDetectSTL {
+		log.Printf("STL auto-detection enabled")
 	}
 
-	// Setup graceful shutdown
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	// Create and start server
+	srv, err := server.New(cfg)
+	if err != nil {
+		log.Fatalf("Error creating server: %v", err)
+	}
 
-	go func() {
-		<-c
-		log.Println("Shutting down server...")
-		srv.Shutdown()
-		os.Exit(0)
-	}()
-
-	// Start server
-	log.Printf("Starting Plandex CLI API server on port %d", cfg.Server.Port)
 	if err := srv.Start(); err != nil {
 		log.Fatalf("Server failed to start: %v", err)
 	}

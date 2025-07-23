@@ -1,0 +1,24 @@
+{
+  "server": {
+    "port": 8080,
+    "host": "0.0.0.0"
+  },
+  "auth": {
+    "api_keys": ["your-api-key-here"],
+    "require_auth": true
+  },
+  "cli": {
+    "project_path": ".",
+    "working_dir": ".",
+    "auto_detect_stl": true,
+    "api_keys": {
+      "OPENAI_API_KEY": "your-openai-api-key-here"
+    },
+    "environment": {
+      "PLANDEX_COLUMNS": "120"
+    }
+  },
+  "webhooks": {
+    "enabled": true
+  }
+}
