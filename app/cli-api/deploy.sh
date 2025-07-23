@@ -321,6 +321,30 @@ show_menu() {
     echo "  ✅ User-level service (no root required)"
 }
 
+# Parse global arguments first
+SILENT=false
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --silent|-y|--yes)
+            SILENT=true
+            shift
+            ;;
+        local|1|autostart|3|disable|status)
+            # Command found, break to handle it
+            break
+            ;;
+        *)
+            if [[ "$1" =~ ^-- ]]; then
+                echo "Unknown option: $1"
+                exit 1
+            else
+                # Assume it's a command
+                break
+            fi
+            ;;
+    esac
+done
+
 # Main command handler
 case "${1:-}" in
     local|1)

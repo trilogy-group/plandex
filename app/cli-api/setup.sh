@@ -7,6 +7,35 @@ GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
+# Parse arguments
+SILENT=false
+INSTALL_CADDY=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --silent|-y|--yes)
+            SILENT=true
+            shift
+            ;;
+        --caddy)
+            INSTALL_CADDY=true
+            shift
+            ;;
+        --help|-h)
+            echo "Usage: $0 [options]"
+            echo "Options:"
+            echo "  --silent, -y   Run without prompts"
+            echo "  --caddy        Install Caddy web server"
+            echo "  --help, -h     Show this help"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
+
 echo -e "${BLUE}🚀 Plandex CLI API Complete Setup${NC}"
 echo
 echo "This script will:"
@@ -15,16 +44,28 @@ echo "  2. Build and configure the Plandex CLI API"
 echo "  3. Provide usage instructions"
 echo
 
-read -p "Continue with setup? (Y/n): " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Nn]$ ]]; then
-    echo "Setup cancelled."
-    exit 0
+if ! $SILENT; then
+    read -p "Continue with setup? (Y/n): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Nn]$ ]]; then
+        echo "Setup cancelled."
+        exit 0
+    fi
 fi
 
 echo -e "${BLUE}Step 1: Installing requirements...${NC}"
 echo
-./install-requirements.sh
+
+# Pass arguments to install-requirements.sh
+INSTALL_ARGS=""
+if $SILENT; then
+    INSTALL_ARGS="$INSTALL_ARGS --silent"
+fi
+if $INSTALL_CADDY; then
+    INSTALL_ARGS="$INSTALL_ARGS --caddy"
+fi
+
+./install-requirements.sh $INSTALL_ARGS
 
 echo
 echo -e "${BLUE}Step 2: Installing Plandex CLI API...${NC}"
