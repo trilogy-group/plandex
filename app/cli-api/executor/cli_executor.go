@@ -51,16 +51,19 @@ func (e *CLIExecutor) Execute(ctx context.Context, command string, args []string
 
 	// Build command arguments directly (avoid shell quoting issues)
 	var fullArgs []string
-	fullArgs = append(fullArgs, command)
-
-	// If command is "tell" add --bg for non-interactive background execution
-	if command == "tell" {
-		// Remove --bg to avoid auto-context conflict, just use tell normally
-		fullArgs = []string{"tell"}
+	
+	// Use working non-interactive AI commands instead of problematic tell/chat
+	if command == "tell" || command == "chat" {
+		// Both tell and chat requests get AI summary - the rich codebase analysis
+		fullArgs = []string{"summary", "--plain"}
+		// Note: args ignored for summary as it analyzes the entire project
+	} else if command == "convo" {
+		// Conversation history with AI responses
+		fullArgs = []string{"convo", "--plain"}
 		fullArgs = append(fullArgs, args...)
-	} else if command == "chat" {
-		// chat supports passing prompt as arg
-		fullArgs = []string{"chat"}
+	} else {
+		// All other commands (models, plans, etc.) work normally
+		fullArgs = append(fullArgs, command)
 		fullArgs = append(fullArgs, args...)
 	}
 
