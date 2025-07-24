@@ -509,25 +509,25 @@ func (s *APIServer) executeJobAsync(job *Job, prompt string, isChatOnly, autoCon
 func (s *APIServer) executePlandexFunction(ctx context.Context, prompt string, isChatOnly, autoContext, autoApply bool) (map[string]interface{}, error) {
 	log.Printf("Debug: Starting CLI subprocess execution")
 	
-	// Build the command
+	// Build the command with non-interactive flags
 	var args []string
 	if isChatOnly {
-		args = []string{"chat"}
+		args = []string{"chat", "--no-stream"}
 	} else {
-		args = []string{"tell"}
+		args = []string{"tell", "--no-stream"}
 		if autoApply {
 			args = append(args, "--apply")
 		}
 	}
 	
-	// Use the working plandex binary
+	// Use the working plandex binary with proper non-interactive setup
 	cmdStr := fmt.Sprintf("echo %q | /usr/local/bin/plandex %s", prompt, strings.Join(args, " "))
 	log.Printf("Debug: Executing command: %s", cmdStr)
 	
 	cmd := exec.CommandContext(ctx, "bash", "-c", cmdStr)
 	cmd.Dir = s.workingDir
 	
-	// Set environment variables
+	// Set environment variables to disable all interactive features
 	cmd.Env = append(os.Environ(),
 		"OPENAI_API_KEY="+os.Getenv("OPENAI_API_KEY"),
 		"PLANDEX_ENV="+os.Getenv("PLANDEX_ENV"),
@@ -537,11 +537,14 @@ func (s *APIServer) executePlandexFunction(ctx context.Context, prompt string, i
 		"PLANDEX_DISABLE_SPINNER=1",
 		"PLANDEX_DISABLE_COLORS=1",
 		"PLANDEX_SKIP_UPGRADE=1",
+		"PLANDEX_NO_STREAM=1",
+		"PLANDEX_NON_INTERACTIVE=1",
 		"TERM=dumb",
 		"NO_COLOR=1",
+		"CI=true",
 	)
 	
-	// Disable stdin to prevent interactive prompts
+	// Disable stdin and redirect to /dev/null to prevent any TTY access
 	cmd.Stdin = nil
 	
 	output, err := cmd.Output()
