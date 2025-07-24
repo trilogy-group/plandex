@@ -25,3 +25,7 @@ __pycache__/
 __pycache__/
 
 .repo_ignore
+
+# Testing
+testing/
+testing/*

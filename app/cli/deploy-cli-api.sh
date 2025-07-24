@@ -47,9 +47,10 @@ check_prerequisites() {
         exit 1
     fi
 
-    if [ ! -f "$CONFIG_PATH" ]; then
-        print_error "Configuration not found at $CONFIG_PATH"
-        print_info "Run './install-cli-api.sh' to create configuration file first"
+    # Check for config in current directory first, then CLI directory
+    if [ ! -f "./plandex-api.json" ] && [ ! -f "$CONFIG_PATH" ]; then
+        print_error "Configuration not found in current directory or at $CONFIG_PATH"
+        print_info "Create plandex-api.json in current directory or run './install-cli-api.sh' first"
         exit 1
     fi
 }
@@ -60,10 +61,18 @@ run_local() {
     
     check_prerequisites
     
+    # Use config from current directory if it exists, otherwise use the CLI directory config
+    LOCAL_CONFIG="./plandex-api.json"
+    if [ -f "$LOCAL_CONFIG" ]; then
+        ACTUAL_CONFIG="$LOCAL_CONFIG"
+    else
+        ACTUAL_CONFIG="$CONFIG_PATH"
+    fi
+    
     # Get configuration details
-    if command -v jq &> /dev/null && [ -f "$CONFIG_PATH" ]; then
-        PORT=$(jq -r '.server.port // 8080' "$CONFIG_PATH" 2>/dev/null)
-        API_KEY=$(jq -r '.auth.api_keys[0] // "not-configured"' "$CONFIG_PATH" 2>/dev/null)
+    if command -v jq &> /dev/null && [ -f "$ACTUAL_CONFIG" ]; then
+        PORT=$(jq -r '.server.port // 8080' "$ACTUAL_CONFIG" 2>/dev/null)
+        API_KEY=$(jq -r '.auth.api_keys[0] // "not-configured"' "$ACTUAL_CONFIG" 2>/dev/null)
     else
         PORT=8080
         API_KEY="not-configured"
@@ -71,8 +80,8 @@ run_local() {
     
     echo
     print_success "Configuration loaded:"
-    echo "  📂 Working directory: $SCRIPT_DIR"
-    echo "  🔧 Config file: $CONFIG_PATH"
+    echo "  📂 Working directory: $(pwd)"
+    echo "  🔧 Config file: $ACTUAL_CONFIG"
     echo "  🚪 Port: $PORT"
     echo "  🔑 API Key: ${API_KEY:0:8}...${API_KEY: -8}"
     echo "  📝 Logs: Will display in console"
@@ -85,9 +94,93 @@ run_local() {
     print_info "Press Ctrl+C to stop"
     echo
     
-    # Start the API
-    cd "$SCRIPT_DIR"
-    exec "$BINARY_PATH" --server --config "$CONFIG_PATH"
+    # Start the API (stay in current working directory)
+    # If using the CLI config, copy it to current directory
+    if [ "$ACTUAL_CONFIG" = "$CONFIG_PATH" ] && [ ! -f "./plandex-api.json" ]; then
+        cp "$CONFIG_PATH" ./plandex-api.json
+        print_info "Copied config file to current directory"
+        ACTUAL_CONFIG="./plandex-api.json"
+    fi
+    exec "$BINARY_PATH" --server --config "$ACTUAL_CONFIG"
+}
+
+# Option 2: Run locally (detached/daemon)
+run_daemon() {
+    print_info "Starting Plandex CLI API as daemon..."
+    
+    check_prerequisites
+    
+    # Use config from current directory if it exists, otherwise use the CLI directory config
+    LOCAL_CONFIG="./plandex-api.json"
+    if [ -f "$LOCAL_CONFIG" ]; then
+        ACTUAL_CONFIG="$LOCAL_CONFIG"
+    else
+        ACTUAL_CONFIG="$CONFIG_PATH"
+    fi
+    
+    # Get configuration details
+    if command -v jq &> /dev/null && [ -f "$ACTUAL_CONFIG" ]; then
+        PORT=$(jq -r '.server.port // 8080' "$ACTUAL_CONFIG" 2>/dev/null)
+        API_KEY=$(jq -r '.auth.api_keys[0] // "not-configured"' "$ACTUAL_CONFIG" 2>/dev/null)
+    else
+        PORT=8080
+        API_KEY="not-configured"
+    fi
+    
+    # Check if already running
+    if [ -f "$PID_FILE" ]; then
+        PID=$(cat "$PID_FILE")
+        if kill -0 "$PID" 2>/dev/null; then
+            print_error "API is already running (PID: $PID)"
+            print_info "Use 'pkill -f plandex-cli-api' to stop it first"
+            exit 1
+        else
+            # Stale PID file
+            rm -f "$PID_FILE"
+        fi
+    fi
+    
+    echo
+    print_success "Configuration loaded:"
+    echo "  📂 Working directory: $(pwd)"
+    echo "  🔧 Config file: $ACTUAL_CONFIG"
+    echo "  🚪 Port: $PORT"
+    echo "  🔑 API Key: ${API_KEY:0:8}...${API_KEY: -8}"
+    echo "  📝 Logs: $LOG_FILE"
+    echo "  📋 PID file: $PID_FILE"
+    
+    echo
+    print_info "API will be available at: http://localhost:$PORT"
+    print_info "Health check: curl -H \"X-API-Key: $API_KEY\" http://localhost:$PORT/api/v1/health"
+    echo
+    
+    # Start the API in background (stay in current working directory)
+    # If using the CLI config, copy it to current directory
+    if [ "$ACTUAL_CONFIG" = "$CONFIG_PATH" ] && [ ! -f "./plandex-api.json" ]; then
+        cp "$CONFIG_PATH" ./plandex-api.json
+        print_info "Copied config file to current directory"
+        ACTUAL_CONFIG="./plandex-api.json"
+    fi
+    
+    # Start daemon
+    nohup "$BINARY_PATH" --server --config "$ACTUAL_CONFIG" > "$LOG_FILE" 2>&1 &
+    DAEMON_PID=$!
+    echo $DAEMON_PID > "$PID_FILE"
+    
+    # Wait a moment and check if it started successfully
+    sleep 2
+    if kill -0 "$DAEMON_PID" 2>/dev/null; then
+        print_success "API started successfully (PID: $DAEMON_PID)"
+        print_info "View logs: tail -f $LOG_FILE"
+        print_info "Stop daemon: kill $DAEMON_PID (or pkill -f plandex-cli-api)"
+    else
+        print_error "Failed to start API daemon"
+        if [ -f "$LOG_FILE" ]; then
+            print_info "Check logs: cat $LOG_FILE"
+        fi
+        rm -f "$PID_FILE"
+        exit 1
+    fi
 }
 
 # Option 3: Setup autostart (systemd with user lingering)
@@ -146,11 +239,19 @@ if [ -z "\$GOPATH" ]; then
     export GOPATH="\$HOME/go"
 fi
 
-# Change to deployment directory
-cd "$SCRIPT_DIR"
+# Stay in user's working directory, but ensure config is available
+LOCAL_CONFIG="./plandex-api.json"
+if [ -f "\$LOCAL_CONFIG" ]; then
+    ACTUAL_CONFIG="\$LOCAL_CONFIG"
+elif [ ! -f "./plandex-api.json" ]; then
+    cp "$CONFIG_PATH" ./plandex-api.json
+    ACTUAL_CONFIG="./plandex-api.json"
+else
+    ACTUAL_CONFIG="./plandex-api.json"
+fi
 
 # Start the API
-exec "$BINARY_PATH" --server --config "$CONFIG_PATH"
+exec "$BINARY_PATH" --server --config "\$ACTUAL_CONFIG"
 EOF
     
     chmod +x "$WRAPPER_SCRIPT"
@@ -167,7 +268,7 @@ Wants=graphical-session.target
 Type=exec
 User=${CURRENT_USER}
 Group=${CURRENT_USER}
-WorkingDirectory=${SCRIPT_DIR}
+WorkingDirectory=$(pwd)
 ExecStart=${WRAPPER_SCRIPT}
 Restart=always
 RestartSec=10
@@ -303,12 +404,38 @@ show_status() {
     fi
 }
 
+# Stop daemon
+stop_daemon() {
+    print_info "Stopping Plandex CLI API daemon..."
+    
+    if [ -f "$PID_FILE" ]; then
+        PID=$(cat "$PID_FILE")
+        if kill -0 "$PID" 2>/dev/null; then
+            kill "$PID"
+            print_success "Stopped daemon (PID: $PID)"
+            rm -f "$PID_FILE"
+        else
+            print_warning "Process not found (PID: $PID)"
+            rm -f "$PID_FILE"
+        fi
+    else
+        print_info "No PID file found - checking for running processes..."
+        if pkill -f "plandex-cli-api"; then
+            print_success "Stopped running plandex-cli-api processes"
+        else
+            print_info "No running plandex-cli-api processes found"
+        fi
+    fi
+}
+
 # Main menu
 show_menu() {
-    echo "Usage: $0 {local|autostart|disable|status}"
+    echo "Usage: $0 {local|daemon|stop|autostart|disable|status}"
     echo
     echo "Commands:"
     echo "  local     - Run API locally in foreground"
+    echo "  daemon    - Run API as detached daemon (for testing)"
+    echo "  stop      - Stop daemon (if running)"
     echo "  autostart - Setup auto-start on boot with systemd"
     echo "  disable   - Disable auto-start"
     echo "  status    - Show deployment status"
@@ -329,7 +456,7 @@ while [[ $# -gt 0 ]]; do
             SILENT=true
             shift
             ;;
-        local|1|autostart|3|disable|status)
+        local|1|daemon|2|stop|autostart|3|disable|status)
             # Command found, break to handle it
             break
             ;;
@@ -349,6 +476,12 @@ done
 case "${1:-}" in
     local|1)
         run_local
+        ;;
+    daemon|2)
+        run_daemon
+        ;;
+    stop)
+        stop_daemon
         ;;
     autostart|3)
         setup_autostart

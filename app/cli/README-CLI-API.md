@@ -8,7 +8,7 @@ The Plandex CLI API exposes core CLI functionality via HTTP endpoints, allowing 
 
 - **Chat**: Ask questions and have conversations without making changes
 - **Tell**: Send implementation prompts that can modify your code
-- **Switch Plans**: Change between existing plans
+- **Switch & List Plans**: Change between existing plans and list available plans
 - **Work Remotely**: Use Plandex from any HTTP client or integrate with other tools
 
 **Important**: The API requires full CLI setup and only works with existing plans and configurations. It does not create plans or configure models - that must be done via the CLI first.

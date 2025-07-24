@@ -8,162 +8,220 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"plandex-cli/api"
 	"plandex-cli/auth"
-	"plandex-cli/fs"
 	"plandex-cli/lib"
 	"plandex-cli/plan_exec"
-	"plandex-cli/term"
 	"plandex-cli/types"
 
 	shared "plandex-shared"
 
-	"github.com/fatih/color"
 	"github.com/gorilla/mux"
 	"github.com/rs/cors"
 )
 
+// Config represents the server configuration
 type Config struct {
-	Server struct {
-		Port         int    `json:"port"`
-		Host         string `json:"host"`
-		ReadTimeout  string `json:"read_timeout"`
-		WriteTimeout string `json:"write_timeout"`
-		IdleTimeout  string `json:"idle_timeout"`
-	} `json:"server"`
-	Auth struct {
-		APIKeys     []string `json:"api_keys"`
-		RequireAuth bool     `json:"require_auth"`
-	} `json:"auth"`
-	CLI struct {
-		WorkingDir  string            `json:"working_dir"`
-		Environment map[string]string `json:"environment"`
-		Timeout     string            `json:"timeout"`
-	} `json:"cli"`
-	Security struct {
-		EnableCORS     bool     `json:"enable_cors"`
-		AllowedOrigins []string `json:"allowed_origins"`
-		RateLimit      int      `json:"rate_limit"`
-		TrustedProxies []string `json:"trusted_proxies"`
-	} `json:"security"`
+	Server   ServerConfig   `json:"server"`
+	Auth     AuthConfig     `json:"auth"`
+	CLI      CLIConfig      `json:"cli"`
+	Jobs     JobsConfig     `json:"jobs"`
+	Webhooks WebhooksConfig `json:"webhooks"`
+	Security SecurityConfig `json:"security"`
 }
 
+type ServerConfig struct {
+	Port         int    `json:"port"`
+	Host         string `json:"host"`
+	ReadTimeout  string `json:"read_timeout"`
+	WriteTimeout string `json:"write_timeout"`
+	IdleTimeout  string `json:"idle_timeout"`
+}
+
+type AuthConfig struct {
+	APIKeys       []string `json:"api_keys"`
+	RequireAuth   bool     `json:"require_auth"`
+	TokenLifetime string   `json:"token_lifetime"`
+}
+
+type CLIConfig struct {
+	WorkingDir  string            `json:"working_dir"`
+	Environment map[string]string `json:"environment"`
+	Timeout     string            `json:"timeout"`
+}
+
+type JobsConfig struct {
+	MaxConcurrent   int    `json:"max_concurrent"`
+	DefaultTTL      string `json:"default_ttl"`
+	CleanupInterval string `json:"cleanup_interval"`
+	MaxHistorySize  int    `json:"max_history_size"`
+}
+
+type WebhooksConfig struct {
+	Enabled      bool   `json:"enabled"`
+	Secret       string `json:"secret"`
+	MaxRetries   int    `json:"max_retries"`
+	RetryBackoff string `json:"retry_backoff"`
+}
+
+type SecurityConfig struct {
+	EnableCORS     bool     `json:"enable_cors"`
+	AllowedOrigins []string `json:"allowed_origins"`
+	RateLimit      int      `json:"rate_limit"`
+	TrustedProxies []string `json:"trusted_proxies"`
+}
+
+// Job represents a CLI operation job
+type Job struct {
+	ID          string                 `json:"job_id"`
+	Status      JobStatus              `json:"status"`
+	CreatedAt   time.Time              `json:"created_at"`
+	StartedAt   *time.Time             `json:"started_at,omitempty"`
+	CompletedAt *time.Time             `json:"completed_at,omitempty"`
+	Result      map[string]interface{} `json:"result,omitempty"`
+	Error       string                 `json:"error,omitempty"`
+	cancel      context.CancelFunc
+	mu          sync.RWMutex
+}
+
+type JobStatus string
+
+const (
+	JobStatusPending   JobStatus = "pending"
+	JobStatusRunning   JobStatus = "running"
+	JobStatusCompleted JobStatus = "completed"
+	JobStatusFailed    JobStatus = "failed"
+	JobStatusCancelled JobStatus = "cancelled"
+)
+
+func (j *Job) SetStatus(status JobStatus) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.Status = status
+	now := time.Now()
+	if status == JobStatusRunning && j.StartedAt == nil {
+		j.StartedAt = &now
+	} else if (status == JobStatusCompleted || status == JobStatusFailed || status == JobStatusCancelled) && j.CompletedAt == nil {
+		j.CompletedAt = &now
+	}
+}
+
+func (j *Job) SetResult(result map[string]interface{}) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.Result = result
+}
+
+func (j *Job) SetError(error string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.Error = error
+}
+
+func (j *Job) GetStatus() JobStatus {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	return j.Status
+}
+
+// JobManager manages concurrent jobs
+type JobManager struct {
+	jobs      map[string]*Job
+	mu        sync.RWMutex
+	semaphore chan struct{}
+}
+
+func NewJobManager(maxConcurrent int) *JobManager {
+	return &JobManager{
+		jobs:      make(map[string]*Job),
+		semaphore: make(chan struct{}, maxConcurrent),
+	}
+}
+
+func (jm *JobManager) AddJob(job *Job) {
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+	jm.jobs[job.ID] = job
+}
+
+func (jm *JobManager) GetJob(id string) (*Job, bool) {
+	jm.mu.RLock()
+	defer jm.mu.RUnlock()
+	job, exists := jm.jobs[id]
+	return job, exists
+}
+
+func (jm *JobManager) ListJobs() map[string]*Job {
+	jm.mu.RLock()
+	defer jm.mu.RUnlock()
+	result := make(map[string]*Job)
+	for k, v := range jm.jobs {
+		result[k] = v
+	}
+	return result
+}
+
+// APIServer represents the HTTP API server
 type APIServer struct {
 	config     *Config
 	router     *mux.Router
 	server     *http.Server
+	jobManager *JobManager
 	workingDir string
 }
 
-type APIResponse struct {
-	Success bool        `json:"success"`
-	Data    interface{} `json:"data,omitempty"`
-	Error   string      `json:"error,omitempty"`
-	Message string      `json:"message,omitempty"`
+// NewServer creates a new API server instance
+func NewServer(config *Config) *APIServer {
+	jobManager := NewJobManager(config.Jobs.MaxConcurrent)
+
+	return &APIServer{
+		config:     config,
+		router:     mux.NewRouter(),
+		jobManager: jobManager,
+		workingDir: config.CLI.WorkingDir,
+	}
 }
 
-type TellRequest struct {
-	Prompt      string `json:"prompt"`
-	PlanName    string `json:"plan_name,omitempty"`
-	AutoApply   bool   `json:"auto_apply,omitempty"`
-	AutoContext bool   `json:"auto_context,omitempty"`
-}
-
-type ChatRequest struct {
-	Prompt   string `json:"prompt"`
-	PlanName string `json:"plan_name,omitempty"`
-}
-
-type PlanRequest struct {
-	Name string `json:"name,omitempty"`
-}
-
+// Start starts the API server
 func Start(configFile string) {
 	config, err := loadConfig(configFile)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	server := &APIServer{
-		config: config,
-	}
+	server := NewServer(config)
 
 	if err := server.initialize(); err != nil {
 		log.Fatalf("Failed to initialize server: %v", err)
 	}
 
-	server.start()
-}
-
-func loadConfig(configFile string) (*Config, error) {
-	if configFile == "" {
-		configFile = "plandex-api.json"
+	log.Printf("Starting Plandex CLI API server on %s:%d", config.Server.Host, config.Server.Port)
+	if err := server.start(); err != nil {
+		log.Fatalf("Server failed to start: %v", err)
 	}
-
-	// Check if config file exists
-	if _, err := os.Stat(configFile); os.IsNotExist(err) {
-		return nil, fmt.Errorf("config file not found: %s", configFile)
-	}
-
-	data, err := os.ReadFile(configFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %v", err)
-	}
-
-	var config Config
-	if err := json.Unmarshal(data, &config); err != nil {
-		return nil, fmt.Errorf("failed to parse config file: %v", err)
-	}
-
-	// Set defaults
-	if config.Server.Port == 0 {
-		config.Server.Port = 8080
-	}
-	if config.Server.Host == "" {
-		config.Server.Host = "127.0.0.1"
-	}
-	if config.Server.ReadTimeout == "" {
-		config.Server.ReadTimeout = "30s"
-	}
-	if config.Server.WriteTimeout == "" {
-		config.Server.WriteTimeout = "30s"
-	}
-	if config.Server.IdleTimeout == "" {
-		config.Server.IdleTimeout = "60s"
-	}
-	if config.CLI.WorkingDir == "" {
-		config.CLI.WorkingDir = "."
-	}
-
-	return &config, nil
 }
 
 func (s *APIServer) initialize() error {
-	// Set working directory
-	absWorkingDir, err := filepath.Abs(s.config.CLI.WorkingDir)
-	if err != nil {
-		return fmt.Errorf("failed to resolve working directory: %v", err)
-	}
-	s.workingDir = absWorkingDir
-
-	// Change to working directory
-	if err := os.Chdir(s.workingDir); err != nil {
-		return fmt.Errorf("failed to change to working directory: %v", err)
+	// Set working directory if specified
+	if s.workingDir != "" {
+		if err := os.Chdir(s.workingDir); err != nil {
+			return fmt.Errorf("failed to change to working directory %s: %v", s.workingDir, err)
+		}
+		log.Printf("Changed working directory to: %s", s.workingDir)
 	}
 
-	// Set environment variables
+	// Set environment variables from config
 	for key, value := range s.config.CLI.Environment {
 		os.Setenv(key, value)
+		log.Printf("Set environment variable: %s=%s", key, value)
 	}
 
-	// Initialize CLI dependencies without interactive prompts
-	term.SetIsRepl(false)
-
-	// Require full CLI setup - authentication and project must exist
+	// Verify CLI setup requirements
 	if err := s.requireFullCLISetup(); err != nil {
 		return fmt.Errorf("CLI setup required: %v", err)
 	}
@@ -172,101 +230,127 @@ func (s *APIServer) initialize() error {
 	return nil
 }
 
+// requireFullCLISetup verifies that CLI is fully configured
 func (s *APIServer) requireFullCLISetup() error {
-	// Check for authentication
-	if _, err := os.Stat(fs.HomeAuthPath); os.IsNotExist(err) {
-		return fmt.Errorf("Plandex CLI authentication not configured. Please run 'plandex auth' first")
-	}
-
-	// Try to resolve auth - this must succeed
+	// Check authentication
 	auth.MustResolveAuthWithOrg()
 	if auth.Current == nil {
-		return fmt.Errorf("authentication failed. Please run 'plandex auth' to configure")
+		return fmt.Errorf("not authenticated - run 'plandex auth' first")
 	}
 
-	// Check for project setup
+	// Check project
 	lib.MustResolveProject()
 	if lib.CurrentProjectId == "" {
-		return fmt.Errorf("no Plandex project found. Please run 'plandex new' to create a project first")
+		return fmt.Errorf("no project found - run 'plandex new' first")
 	}
 
-	// Require at least one existing plan
-	plans, apiErr := api.Client.ListPlans([]string{lib.CurrentProjectId})
-	if apiErr != nil {
-		return fmt.Errorf("failed to list plans: %v", apiErr)
-	}
-
-	if len(plans) == 0 {
-		return fmt.Errorf("no plans exist. Please create a plan using 'plandex new' first")
-	}
-
-	// Require a current plan to be set
+	// Check current plan
 	if lib.CurrentPlanId == "" {
-		return fmt.Errorf("no current plan set. Please select a plan using 'plandex cd <plan-name>' first")
+		return fmt.Errorf("no current plan - run 'plandex new' to create a plan")
 	}
 
-	// Verify the current plan exists and has proper configuration
-	var currentPlan *shared.Plan
-	for _, plan := range plans {
-		if plan.Id == lib.CurrentPlanId {
-			currentPlan = plan
-			break
-		}
+	// Verify model configuration by attempting to get plan config
+	_, err := api.Client.GetPlanConfig(lib.CurrentPlanId)
+	if err != nil {
+		return fmt.Errorf("plan not properly configured - ensure models are set up")
 	}
 
-	if currentPlan == nil {
-		return fmt.Errorf("current plan not found. Please select a valid plan using 'plandex cd <plan-name>' first")
-	}
-
-	log.Printf("✅ CLI setup verified - authenticated as %s, project: %s, current plan: %s",
-		auth.Current.Email, lib.CurrentProjectId, currentPlan.Name)
-
+	log.Printf("✅ CLI fully configured - Project: %s, Plan: %s", lib.CurrentProjectId, lib.CurrentPlanId)
 	return nil
 }
 
 func (s *APIServer) setupRoutes() {
-	s.router = mux.NewRouter()
-
-	// Add API key middleware if auth is required
+	// Middleware
 	if s.config.Auth.RequireAuth {
 		s.router.Use(s.authMiddleware)
 	}
 
-	// Add logging middleware
-	s.router.Use(s.loggingMiddleware)
+	// Health endpoint (no auth required)
+	s.router.HandleFunc("/api/v1/health", s.handleHealth).Methods("GET")
 
-	// API routes
-	api := s.router.PathPrefix("/api/v1").Subrouter()
+	// Status endpoint
+	s.router.HandleFunc("/api/v1/status", s.handleStatus).Methods("GET")
 
-	// Health check
-	api.HandleFunc("/health", s.handleHealth).Methods("GET")
-	api.HandleFunc("/status", s.handleStatus).Methods("GET")
+	// Chat endpoint
+	s.router.HandleFunc("/api/v1/chat", s.handleChat).Methods("POST")
 
-	// Chat and Tell - core functionality
-	api.HandleFunc("/chat", s.handleChat).Methods("POST")
-	api.HandleFunc("/tell", s.handleTell).Methods("POST")
+	// Tell endpoint
+	s.router.HandleFunc("/api/v1/tell", s.handleTell).Methods("POST")
 
-	// Plan management - read-only and switch only, no creation
-	api.HandleFunc("/plans", s.handlePlans).Methods("GET")
-	api.HandleFunc("/plans/current", s.handleCurrentPlan).Methods("GET")
-	api.HandleFunc("/plans/current", s.handleSetCurrentPlan).Methods("POST")
+	// Plans management
+	s.router.HandleFunc("/api/v1/plans", s.handleListPlans).Methods("GET")
+	s.router.HandleFunc("/api/v1/plans/current", s.handleCurrentPlan).Methods("GET")
 
-	// Remove plan creation endpoint - not allowed via API
-	// Remove job management - keep it simple
+	// Jobs management
+	s.router.HandleFunc("/api/v1/jobs", s.handleListJobs).Methods("GET")
+	s.router.HandleFunc("/api/v1/jobs/{id}", s.handleGetJob).Methods("GET")
+	s.router.HandleFunc("/api/v1/jobs/{id}/cancel", s.handleCancelJob).Methods("POST")
+
+	log.Println("✅ Routes configured")
+}
+
+func (s *APIServer) start() error {
+	readTimeout, _ := time.ParseDuration(s.config.Server.ReadTimeout)
+	writeTimeout, _ := time.ParseDuration(s.config.Server.WriteTimeout)
+	idleTimeout, _ := time.ParseDuration(s.config.Server.IdleTimeout)
+
+	s.server = &http.Server{
+		Addr:         fmt.Sprintf("%s:%d", s.config.Server.Host, s.config.Server.Port),
+		Handler:      s.getCORSHandler(),
+		ReadTimeout:  readTimeout,
+		WriteTimeout: writeTimeout,
+		IdleTimeout:  idleTimeout,
+	}
+
+	// Graceful shutdown
+	go s.handleShutdown()
+
+	return s.server.ListenAndServe()
+}
+
+func (s *APIServer) getCORSHandler() http.Handler {
+	if s.config.Security.EnableCORS {
+		c := cors.New(cors.Options{
+			AllowedOrigins: s.config.Security.AllowedOrigins,
+			AllowedMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+			AllowedHeaders: []string{"*"},
+		})
+		return c.Handler(s.router)
+	}
+	return s.router
+}
+
+func (s *APIServer) handleShutdown() {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+
+	<-c
+	log.Println("Shutting down server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	s.server.Shutdown(ctx)
+	log.Println("Server stopped")
 }
 
 func (s *APIServer) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		apiKey := r.Header.Get("X-API-Key")
-		if apiKey == "" {
-			s.writeError(w, http.StatusUnauthorized, "API key required")
+		// Skip auth for health endpoint
+		if r.URL.Path == "/api/v1/health" {
+			next.ServeHTTP(w, r)
 			return
 		}
 
-		// Check if API key is valid
+		apiKey := r.Header.Get("X-API-Key")
+		if apiKey == "" {
+			s.writeError(w, http.StatusUnauthorized, "Missing API key")
+			return
+		}
+
 		validKey := false
 		for _, key := range s.config.Auth.APIKeys {
-			if key == apiKey {
+			if apiKey == key {
 				validKey = true
 				break
 			}
@@ -278,50 +362,6 @@ func (s *APIServer) authMiddleware(next http.Handler) http.Handler {
 		}
 
 		next.ServeHTTP(w, r)
-	})
-}
-
-func (s *APIServer) loggingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-
-		// Wrap the ResponseWriter to capture status code
-		wrapped := &statusResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
-
-		next.ServeHTTP(wrapped, r)
-
-		log.Printf("%s %s %d %v", r.Method, r.URL.Path, wrapped.statusCode, time.Since(start))
-	})
-}
-
-type statusResponseWriter struct {
-	http.ResponseWriter
-	statusCode int
-}
-
-func (w *statusResponseWriter) WriteHeader(code int) {
-	w.statusCode = code
-	w.ResponseWriter.WriteHeader(code)
-}
-
-func (s *APIServer) writeJSON(w http.ResponseWriter, status int, response APIResponse) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(response)
-}
-
-func (s *APIServer) writeError(w http.ResponseWriter, status int, message string) {
-	s.writeJSON(w, status, APIResponse{
-		Success: false,
-		Error:   message,
-	})
-}
-
-func (s *APIServer) writeSuccess(w http.ResponseWriter, data interface{}, message string) {
-	s.writeJSON(w, http.StatusOK, APIResponse{
-		Success: true,
-		Data:    data,
-		Message: message,
 	})
 }
 
@@ -344,103 +384,182 @@ func (s *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	if auth.Current != nil {
 		status["user"] = auth.Current.Email
-		status["org"] = auth.Current.OrgName
+		if auth.Current.OrgName != "" {
+			status["org"] = auth.Current.OrgName
+		}
 	}
 
 	s.writeSuccess(w, status, "Current status")
 }
 
+type ChatRequest struct {
+	Prompt      string `json:"prompt"`
+	AutoContext bool   `json:"auto_context,omitempty"`
+}
+
+type TellRequest struct {
+	Prompt      string `json:"prompt"`
+	AutoContext bool   `json:"auto_context,omitempty"`
+	AutoApply   bool   `json:"auto_apply,omitempty"`
+}
+
+type JobResponse struct {
+	JobID     string    `json:"job_id"`
+	Status    JobStatus `json:"status"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 func (s *APIServer) handleChat(w http.ResponseWriter, r *http.Request) {
 	var req ChatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid JSON")
+		s.writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	if req.Prompt == "" {
-		s.writeError(w, http.StatusBadRequest, "Prompt is required")
+	if strings.TrimSpace(req.Prompt) == "" {
+		s.writeError(w, http.StatusBadRequest, "Prompt cannot be empty")
 		return
 	}
 
-	// Switch to requested plan if specified (must be existing plan)
-	if req.PlanName != "" {
-		if err := s.switchToPlan(req.PlanName); err != nil {
-			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Failed to switch to plan: %v", err))
-			return
-		}
+	// Create job
+	job := &Job{
+		ID:        generateJobID(),
+		Status:    JobStatusPending,
+		CreatedAt: time.Now(),
 	}
 
-	// Verify we have a current plan (should always be true after requireFullCLISetup)
-	if lib.CurrentPlanId == "" {
-		s.writeError(w, http.StatusInternalServerError, "No current plan available. Please select a plan using CLI first.")
-		return
-	}
+	s.jobManager.AddJob(job)
 
-	// Execute chat command
-	result, err := s.executeChat(req.Prompt)
-	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
-		return
-	}
+	// Execute chat asynchronously
+	go s.executeJobAsync(job, req.Prompt, true, req.AutoContext, false)
 
-	s.writeSuccess(w, result, "Chat completed successfully")
+	s.writeSuccess(w, JobResponse{
+		JobID:     job.ID,
+		Status:    job.Status,
+		CreatedAt: job.CreatedAt,
+	}, "Chat job created successfully")
 }
 
 func (s *APIServer) handleTell(w http.ResponseWriter, r *http.Request) {
 	var req TellRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid JSON")
+		s.writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	if req.Prompt == "" {
-		s.writeError(w, http.StatusBadRequest, "Prompt is required")
+	if strings.TrimSpace(req.Prompt) == "" {
+		s.writeError(w, http.StatusBadRequest, "Prompt cannot be empty")
 		return
 	}
 
-	// Switch to requested plan if specified (must be existing plan)
-	if req.PlanName != "" {
-		if err := s.switchToPlan(req.PlanName); err != nil {
-			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Failed to switch to plan: %v", err))
-			return
-		}
+	// Create job
+	job := &Job{
+		ID:        generateJobID(),
+		Status:    JobStatusPending,
+		CreatedAt: time.Now(),
 	}
 
-	// Verify we have a current plan (should always be true after requireFullCLISetup)
-	if lib.CurrentPlanId == "" {
-		s.writeError(w, http.StatusInternalServerError, "No current plan available. Please select a plan using CLI first.")
-		return
-	}
+	s.jobManager.AddJob(job)
 
-	// Execute tell command
-	result, err := s.executeTell(req.Prompt, req.AutoApply, req.AutoContext)
-	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("Tell failed: %v", err))
-		return
-	}
+	// Execute tell asynchronously
+	go s.executeJobAsync(job, req.Prompt, false, req.AutoContext, req.AutoApply)
 
-	s.writeSuccess(w, result, "Tell completed successfully")
+	s.writeSuccess(w, JobResponse{
+		JobID:     job.ID,
+		Status:    job.Status,
+		CreatedAt: job.CreatedAt,
+	}, "Tell job created successfully")
 }
 
-func (s *APIServer) handlePlans(w http.ResponseWriter, r *http.Request) {
-	// Get plans using the CLI API
+// executeJobAsync runs the Plandex command directly using plan_exec.TellPlan
+func (s *APIServer) executeJobAsync(job *Job, prompt string, isChatOnly, autoContext, autoApply bool) {
+	// Create context for cancellation
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	job.cancel = cancel
+
+	// Execute the Plandex function directly
+	go func() {
+		defer cancel() // Move cancel to inside the goroutine
+		defer func() {
+			if r := recover(); r != nil {
+				job.SetError(fmt.Sprintf("Job panicked: %v", r))
+				job.SetStatus(JobStatusFailed)
+			}
+		}()
+
+		job.SetStatus(JobStatusRunning)
+
+		// Call plan_exec.TellPlan directly instead of using subprocess
+		result, err := s.executePlandexFunction(ctx, prompt, isChatOnly, autoContext, autoApply)
+
+		if err != nil {
+			job.SetError(fmt.Sprintf("Plandex execution failed: %v", err))
+			job.SetStatus(JobStatusFailed)
+			return
+		}
+
+		job.SetResult(result)
+		job.SetStatus(JobStatusCompleted)
+	}()
+}
+
+// executePlandexFunction calls plan_exec.TellPlan directly
+func (s *APIServer) executePlandexFunction(ctx context.Context, prompt string, isChatOnly, autoContext, autoApply bool) (map[string]interface{}, error) {
+	// Debug: Check environment variables
+	log.Printf("Debug: Environment variables during function execution:")
+	log.Printf("Debug: OPENAI_API_KEY present: %v", os.Getenv("OPENAI_API_KEY") != "")
+	log.Printf("Debug: LOCAL_MODE: %s", os.Getenv("LOCAL_MODE"))
+	log.Printf("Debug: PLANDEX_ENV: %s", os.Getenv("PLANDEX_ENV"))
+
+	// Prepare execution parameters
+	authVars := lib.MustVerifyAuthVarsSilent(auth.Current.IntegratedModelsMode)
+
+	params := plan_exec.ExecParams{
+		CurrentPlanId: lib.CurrentPlanId,
+		CurrentBranch: lib.CurrentBranch,
+		AuthVars:      authVars,
+		CheckOutdatedContext: func(maybeContexts []*shared.Context, projectPaths *types.ProjectPaths) (bool, bool, error) {
+			// For API mode, auto-handle outdated context
+			auto := autoContext || autoApply
+			return lib.CheckOutdatedContextWithOutput(auto, auto, maybeContexts, projectPaths)
+		},
+	}
+
+	// Configure tell flags
+	flags := types.TellFlags{
+		IsChatOnly:      isChatOnly,
+		AutoContext:     autoContext,
+		AutoApply:       autoApply,
+		SkipChangesMenu: true,        // Always skip interactive menus in API mode
+		ExecEnabled:     !isChatOnly, // Enable execution for tell, disable for chat
+		TellBg:          true,        // Run in background mode to avoid streaming UI
+	}
+
+	// Call TellPlan directly
+	plan_exec.TellPlan(params, prompt, flags)
+
+	// Build result response
+	result := map[string]interface{}{
+		"prompt":       prompt,
+		"is_chat_only": isChatOnly,
+		"auto_context": autoContext,
+		"auto_apply":   autoApply,
+		"plan_id":      lib.CurrentPlanId,
+		"branch":       lib.CurrentBranch,
+		"status":       "completed",
+	}
+
+	return result, nil
+}
+
+func (s *APIServer) handleListPlans(w http.ResponseWriter, r *http.Request) {
 	plans, apiErr := api.Client.ListPlans([]string{lib.CurrentProjectId})
 	if apiErr != nil {
-		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to list plans: %v", apiErr))
+		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to list plans: %v", apiErr.Msg))
 		return
 	}
 
-	// Convert to API response format
-	planList := make([]map[string]interface{}, len(plans))
-	for i, plan := range plans {
-		planList[i] = map[string]interface{}{
-			"id":      plan.Id,
-			"name":    plan.Name,
-			"current": plan.Id == lib.CurrentPlanId,
-		}
-	}
-
-	s.writeSuccess(w, planList, "Plans retrieved")
+	s.writeSuccess(w, plans, "Plans retrieved successfully")
 }
 
 func (s *APIServer) handleCurrentPlan(w http.ResponseWriter, r *http.Request) {
@@ -449,210 +568,98 @@ func (s *APIServer) handleCurrentPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.writeSuccess(w, map[string]string{
-		"id":     lib.CurrentPlanId,
-		"branch": lib.CurrentBranch,
-	}, "Current plan")
-}
-
-func (s *APIServer) handleSetCurrentPlan(w http.ResponseWriter, r *http.Request) {
-	var req PlanRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid JSON")
-		return
-	}
-
-	if req.Name == "" {
-		s.writeError(w, http.StatusBadRequest, "Plan name is required")
-		return
-	}
-
-	if err := s.switchToPlan(req.Name); err != nil {
-		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Failed to switch to plan: %v", err))
-		return
-	}
-
-	s.writeSuccess(w, map[string]string{
-		"id":   lib.CurrentPlanId,
-		"name": req.Name,
-	}, "Switched to plan")
-}
-
-func (s *APIServer) switchToPlan(planName string) error {
-	// Get available plans
-	plans, apiErr := api.Client.ListPlans([]string{lib.CurrentProjectId})
+	plan, apiErr := api.Client.GetPlan(lib.CurrentPlanId)
 	if apiErr != nil {
-		return fmt.Errorf("failed to list plans: %v", apiErr)
+		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get current plan: %v", apiErr.Msg))
+		return
 	}
 
-	// Find the plan by name
-	var targetPlan *shared.Plan
-	for _, plan := range plans {
-		if plan.Name == planName {
-			targetPlan = plan
-			break
-		}
+	result := map[string]interface{}{
+		"plan":   plan,
+		"branch": lib.CurrentBranch,
 	}
 
-	if targetPlan == nil {
-		return fmt.Errorf("plan not found: %s. Available plans: %v", planName, s.getAvailablePlanNames(plans))
-	}
-
-	// Switch to the plan
-	if err := lib.WriteCurrentPlan(targetPlan.Id); err != nil {
-		return fmt.Errorf("failed to set current plan: %v", err)
-	}
-
-	// Reload current plan
-	lib.MustLoadCurrentPlan()
-
-	return nil
+	s.writeSuccess(w, result, "Current plan retrieved successfully")
 }
 
-func (s *APIServer) getAvailablePlanNames(plans []*shared.Plan) []string {
-	names := make([]string, len(plans))
-	for i, plan := range plans {
-		names[i] = plan.Name
-	}
-	return names
+func (s *APIServer) handleListJobs(w http.ResponseWriter, r *http.Request) {
+	jobs := s.jobManager.ListJobs()
+	s.writeSuccess(w, jobs, "Jobs retrieved successfully")
 }
 
-func (s *APIServer) executeChat(prompt string) (interface{}, error) {
-	// Execute chat using the CLI's plan_exec.TellPlan with chat-only flag
-	tellFlags := types.TellFlags{
-		IsChatOnly:  true,
-		AutoContext: false,
-		ExecEnabled: false,
+func (s *APIServer) handleGetJob(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	jobID := vars["id"]
+
+	job, exists := s.jobManager.GetJob(jobID)
+	if !exists {
+		s.writeError(w, http.StatusNotFound, "Job not found")
+		return
 	}
 
-	// Use plan_exec.TellPlan which is the same function the CLI uses
-	plan_exec.TellPlan(plan_exec.ExecParams{
-		CurrentPlanId: lib.CurrentPlanId,
-		CurrentBranch: lib.CurrentBranch,
-		AuthVars:      lib.MustVerifyAuthVars(auth.Current.IntegratedModelsMode),
-		CheckOutdatedContext: func(maybeContexts []*shared.Context, projectPaths *types.ProjectPaths) (bool, bool, error) {
-			// Auto-confirm for API mode
-			return lib.CheckOutdatedContextWithOutput(true, true, maybeContexts, projectPaths)
-		},
-	}, prompt, tellFlags)
-
-	return map[string]interface{}{
-		"prompt":   prompt,
-		"response": "Chat executed successfully",
-		"mode":     "chat",
-		"plan_id":  lib.CurrentPlanId,
-	}, nil
+	s.writeSuccess(w, job, "Job retrieved")
 }
 
-func (s *APIServer) executeTell(prompt string, autoApply, autoContext bool) (interface{}, error) {
-	// Execute tell using the CLI's plan_exec.TellPlan
-	tellFlags := types.TellFlags{
-		IsChatOnly:      false,
-		AutoContext:     autoContext,
-		ExecEnabled:     true,
-		AutoApply:       autoApply,
-		SkipChangesMenu: true, // Skip interactive menus in API mode
+func (s *APIServer) handleCancelJob(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	jobID := vars["id"]
+
+	job, exists := s.jobManager.GetJob(jobID)
+	if !exists {
+		s.writeError(w, http.StatusNotFound, "Job not found")
+		return
 	}
 
-	// Use plan_exec.TellPlan which is the same function the CLI uses
-	plan_exec.TellPlan(plan_exec.ExecParams{
-		CurrentPlanId: lib.CurrentPlanId,
-		CurrentBranch: lib.CurrentBranch,
-		AuthVars:      lib.MustVerifyAuthVars(auth.Current.IntegratedModelsMode),
-		CheckOutdatedContext: func(maybeContexts []*shared.Context, projectPaths *types.ProjectPaths) (bool, bool, error) {
-			// Auto-confirm for API mode
-			return lib.CheckOutdatedContextWithOutput(true, true, maybeContexts, projectPaths)
-		},
-	}, prompt, tellFlags)
-
-	if autoApply {
-		applyFlags := types.ApplyFlags{
-			AutoConfirm: true,
-			AutoCommit:  true,
-			NoCommit:    false,
-			AutoExec:    true,
-			NoExec:      false,
-		}
-
-		lib.MustApplyPlan(lib.ApplyPlanParams{
-			PlanId:     lib.CurrentPlanId,
-			Branch:     lib.CurrentBranch,
-			ApplyFlags: applyFlags,
-			TellFlags:  tellFlags,
-			OnExecFail: plan_exec.GetOnApplyExecFail(applyFlags, tellFlags),
-		})
+	if job.cancel != nil {
+		job.cancel()
 	}
+	job.SetStatus(JobStatusCancelled)
 
-	return map[string]interface{}{
-		"prompt":       prompt,
-		"response":     "Tell executed successfully",
-		"mode":         "tell",
-		"auto_apply":   autoApply,
-		"auto_context": autoContext,
-		"plan_id":      lib.CurrentPlanId,
-	}, nil
+	s.writeSuccess(w, map[string]interface{}{"job_id": jobID}, "Job cancelled")
 }
 
-func (s *APIServer) start() {
-	// Parse timeouts
-	readTimeout, _ := time.ParseDuration(s.config.Server.ReadTimeout)
-	writeTimeout, _ := time.ParseDuration(s.config.Server.WriteTimeout)
-	idleTimeout, _ := time.ParseDuration(s.config.Server.IdleTimeout)
+// Response helpers
+type APIResponse struct {
+	Success bool        `json:"success"`
+	Data    interface{} `json:"data,omitempty"`
+	Error   string      `json:"error,omitempty"`
+	Message string      `json:"message,omitempty"`
+}
 
-	// Create HTTP server
-	addr := fmt.Sprintf("%s:%d", s.config.Server.Host, s.config.Server.Port)
+func (s *APIServer) writeSuccess(w http.ResponseWriter, data interface{}, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(APIResponse{
+		Success: true,
+		Data:    data,
+		Message: message,
+	})
+}
 
-	var handler http.Handler = s.router
+func (s *APIServer) writeError(w http.ResponseWriter, statusCode int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(APIResponse{
+		Success: false,
+		Error:   message,
+	})
+}
 
-	// Add CORS if enabled
-	if s.config.Security.EnableCORS {
-		c := cors.New(cors.Options{
-			AllowedOrigins: s.config.Security.AllowedOrigins,
-			AllowedMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-			AllowedHeaders: []string{"*"},
-		})
-		handler = c.Handler(s.router)
+// Utility functions
+func loadConfig(configFile string) (*Config, error) {
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %v", err)
 	}
 
-	s.server = &http.Server{
-		Addr:         addr,
-		Handler:      handler,
-		ReadTimeout:  readTimeout,
-		WriteTimeout: writeTimeout,
-		IdleTimeout:  idleTimeout,
+	var config Config
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("failed to parse config file: %v", err)
 	}
 
-	// Start server in a goroutine
-	go func() {
-		color.New(color.Bold, color.FgGreen).Printf("🚀 Plandex CLI API server starting on %s\n", addr)
-		color.New(color.FgCyan).Printf("📂 Working directory: %s\n", s.workingDir)
-		color.New(color.FgCyan).Printf("🔍 Health check: http://%s/api/v1/health\n", addr)
+	return &config, nil
+}
 
-		if s.config.Auth.RequireAuth && len(s.config.Auth.APIKeys) > 0 {
-			color.New(color.FgYellow).Printf("🔑 API Key required (configured: %d keys)\n", len(s.config.Auth.APIKeys))
-		}
-
-		fmt.Println()
-
-		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Failed to start server: %v", err)
-		}
-	}()
-
-	// Wait for interrupt signal to gracefully shutdown
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-
-	color.New(color.FgYellow).Println("\n🛑 Shutting down server...")
-
-	// Graceful shutdown
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	if err := s.server.Shutdown(ctx); err != nil {
-		log.Printf("Error during shutdown: %v", err)
-	}
-
-	color.New(color.FgGreen).Println("✅ Server stopped")
+func generateJobID() string {
+	// Simple job ID generation
+	return fmt.Sprintf("%d", time.Now().UnixNano())
 }
