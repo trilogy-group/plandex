@@ -40,7 +40,7 @@ func NewManager(cfg *config.Config) *Manager {
 		webhookSender: webhooks.NewSender(cfg),
 		ctx:           ctx,
 		cancel:        cancel,
-		executor:      executor.NewCLIExecutor(cfg.CLI.WorkingDir, cfg.CLI.ProjectPath, cfg.CLI.APIKeys, cfg.CLI.Environment),
+		executor:      executor.NewCLIExecutor(cfg.CLI.WorkingDir, cfg.CLI.APIKeys, cfg.CLI.Environment),
 	}
 
 	// Start cleanup routine
@@ -196,8 +196,8 @@ func (m *Manager) executeJob(job *Job) {
 		go m.webhookSender.Send(job.WebhookURL, update)
 	}
 
-	// Create a context for this job execution that can be cancelled
-	jobCtx, cancelFn := context.WithCancel(m.ctx)
+	// Create a cancellable context for this job
+	_, cancelFn := context.WithCancel(context.Background())
 	defer cancelFn()
 
 	// Track running command cancellation function
@@ -206,60 +206,27 @@ func (m *Manager) executeJob(job *Job) {
 	m.runningMutex.Unlock()
 
 	// Execute command using CLI executor
-	result, err := m.executor.Execute(jobCtx, job.Command, job.Args)
+	result := m.executor.Execute(job.Command, job.Args)
 
 	// Clean up running command tracking
 	m.runningMutex.Lock()
 	delete(m.running, job.ID)
 	m.runningMutex.Unlock()
 
-	var output string
-	if result != nil {
-		output = result.Output
-		if result.Error != "" {
-			if output != "" {
-				output += "\n"
-			}
-			output += result.Error
-		}
-	}
-
-	// Update job with results
+	// Update job with result
 	m.jobsMutex.Lock()
+	defer m.jobsMutex.Unlock()
+
 	completedAt := time.Now()
 	job.CompletedAt = &completedAt
-	job.Output = string(output)
 
-	if err != nil || (result != nil && result.ExitCode != 0) {
+	if result.ExitCode != 0 {
 		job.Status = JobStatusFailed
-		if err != nil {
-			job.Error = err.Error()
-		}
-		if result != nil {
-			job.ExitCode = &result.ExitCode
-		} else {
-			exitCode := 1
-			job.ExitCode = &exitCode
-		}
+		job.Output = fmt.Sprintf("Command failed with exit code %d\nOutput: %s\nError: %s", result.ExitCode, result.Output, result.Error)
 	} else {
 		job.Status = JobStatusCompleted
-		exitCode := 0
-		job.ExitCode = &exitCode
-	}
-	m.jobsMutex.Unlock()
-
-	// Send final webhook notification
-	if job.WebhookURL != "" {
-		update := &webhooks.JobStatusUpdate{
-			JobID:       job.ID,
-			Status:      string(job.Status),
-			CompletedAt: job.CompletedAt,
-			Output:      job.Output,
-			Error:       job.Error,
-			ExitCode:    job.ExitCode,
-			Metadata:    job.Metadata,
-		}
-		go m.webhookSender.Send(job.WebhookURL, update)
+		job.Output = result.Output
+		job.ExitCode = &result.ExitCode
 	}
 }
 
