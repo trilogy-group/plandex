@@ -48,7 +48,7 @@ func shellQuote(s string) string {
 func (e *CLIExecutor) Execute(ctx context.Context, command string, args []string) (*ExecuteResult, error) {
 	cmdCtx, cancel := context.WithTimeout(ctx, e.timeout)
 	defer cancel()
-	
+
 	// Build command arguments directly (avoid shell quoting issues)
 	var fullArgs []string
 	fullArgs = append(fullArgs, command)
@@ -65,20 +65,20 @@ func (e *CLIExecutor) Execute(ctx context.Context, command string, args []string
 
 	cmd := exec.CommandContext(cmdCtx, e.plandexBinary, fullArgs...)
 	cmd.Dir = e.workingDir
-	
+
 	// Set environment for non-interactive mode
 	env := os.Environ()
-	
+
 	// Add API keys from configuration
 	for key, value := range e.apiKeys {
 		env = append(env, fmt.Sprintf("%s=%s", key, value))
 	}
-	
+
 	// Add custom environment variables
 	for key, value := range e.environment {
 		env = append(env, fmt.Sprintf("%s=%s", key, value))
 	}
-	
+
 	// Add non-interactive mode variables to disable TTY requirements
 	env = append(env,
 		"PLANDEX_DISABLE_TTY=1",
@@ -87,6 +87,24 @@ func (e *CLIExecutor) Execute(ctx context.Context, command string, args []string
 		"NO_COLOR=1",
 		"PLANDEX_SKIP_UPGRADE=1",
 	)
+	
+	// Ensure OPENAI_API_KEY is explicitly set from config
+	if openaiKey, exists := e.apiKeys["OPENAI_API_KEY"]; exists && openaiKey != "" {
+		env = append(env, fmt.Sprintf("OPENAI_API_KEY=%s", openaiKey))
+	}
+	
+	// Debug: Log environment setup for AI commands
+	if command == "chat" || command == "tell" {
+		fmt.Printf("DEBUG: Executing %s with args: %v\n", command, args)
+		fmt.Printf("DEBUG: Working dir: %s\n", e.workingDir)
+		for _, envVar := range env {
+			if strings.Contains(envVar, "OPENAI_API_KEY") {
+				fmt.Printf("DEBUG: API key found in env\n")
+				break
+			}
+		}
+	}
+
 	cmd.Env = env
 
 	var outBuilder, errBuilder strings.Builder
