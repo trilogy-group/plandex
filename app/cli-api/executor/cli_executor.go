@@ -55,7 +55,8 @@ func (e *CLIExecutor) Execute(ctx context.Context, command string, args []string
 
 	// If command is "tell" add --bg for non-interactive background execution
 	if command == "tell" {
-		fullArgs = []string{"tell", "--bg"}
+		// Use --apply with tell to execute changes and avoid auto-context conflicts
+		fullArgs = []string{"tell", "--apply"}
 		fullArgs = append(fullArgs, args...)
 	} else if command == "chat" {
 		// chat supports passing prompt as arg
