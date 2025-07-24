@@ -435,8 +435,9 @@ func (s *APIServer) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	s.jobManager.AddJob(job)
 
-	// Execute chat asynchronously
-	go s.executeJobAsync(job, req.Prompt, true, req.AutoContext, false)
+	// Execute chat asynchronously with auto_context=true by default
+	autoContext := true // Default to true for automation
+	go s.executeJobAsync(job, req.Prompt, true, autoContext, false)
 
 	s.writeSuccess(w, JobResponse{
 		JobID:     job.ID,
@@ -466,8 +467,10 @@ func (s *APIServer) handleTell(w http.ResponseWriter, r *http.Request) {
 
 	s.jobManager.AddJob(job)
 
-	// Execute tell asynchronously
-	go s.executeJobAsync(job, req.Prompt, false, req.AutoContext, req.AutoApply)
+	// Execute tell asynchronously with auto_context=true by default
+	autoContext := true // Default to true for automation
+	autoApply := true   // Default to true for automation
+	go s.executeJobAsync(job, req.Prompt, false, autoContext, autoApply)
 
 	s.writeSuccess(w, JobResponse{
 		JobID:     job.ID,
@@ -510,6 +513,15 @@ func (s *APIServer) executeJobAsync(job *Job, prompt string, isChatOnly, autoCon
 
 // executePlandexFunction calls plan_exec.TellPlan directly
 func (s *APIServer) executePlandexFunction(ctx context.Context, prompt string, isChatOnly, autoContext, autoApply bool) (map[string]interface{}, error) {
+	// Add panic recovery to handle errors like concurrent stream conflicts
+	var panicErr error
+	defer func() {
+		if r := recover(); r != nil {
+			panicErr = fmt.Errorf("TellPlan execution failed: %v", r)
+			log.Printf("Error: TellPlan panicked: %v", r)
+		}
+	}()
+
 	// Set environment variables to disable TTY/UI components
 	os.Setenv("PLANDEX_DISABLE_TUI", "1")
 	os.Setenv("PLANDEX_HEADLESS", "1") 
@@ -546,8 +558,13 @@ func (s *APIServer) executePlandexFunction(ctx context.Context, prompt string, i
 
 	log.Printf("Debug: Calling TellPlan directly with flags: %+v", flags)
 
-	// Call TellPlan directly
+	// Call TellPlan directly with error handling
 	plan_exec.TellPlan(params, prompt, flags)
+
+	// Check if panic occurred during execution
+	if panicErr != nil {
+		return nil, panicErr
+	}
 
 	log.Printf("Debug: TellPlan completed successfully")
 
