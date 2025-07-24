@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"sync"
@@ -16,10 +17,6 @@ import (
 	"plandex-cli/api"
 	"plandex-cli/auth"
 	"plandex-cli/lib"
-	"plandex-cli/plan_exec"
-	"plandex-cli/types"
-
-	shared "plandex-shared"
 
 	"github.com/gorilla/mux"
 	"github.com/rs/cors"
@@ -232,30 +229,35 @@ func (s *APIServer) initialize() error {
 
 // requireFullCLISetup verifies that CLI is fully configured
 func (s *APIServer) requireFullCLISetup() error {
+	log.Printf("Debug: Starting CLI setup verification...")
+
 	// Check authentication
+	log.Printf("Debug: Checking authentication...")
 	auth.MustResolveAuthWithOrg()
 	if auth.Current == nil {
+		log.Printf("Debug: Authentication failed - auth.Current is nil")
 		return fmt.Errorf("not authenticated - run 'plandex auth' first")
 	}
+	log.Printf("Debug: Authentication OK - User: %s, Org: %s", auth.Current.Email, auth.Current.OrgName)
 
 	// Check project
+	log.Printf("Debug: Checking project...")
 	lib.MustResolveProject()
 	if lib.CurrentProjectId == "" {
+		log.Printf("Debug: Project resolution failed - CurrentProjectId is empty")
 		return fmt.Errorf("no project found - run 'plandex new' first")
 	}
+	log.Printf("Debug: Project OK - ProjectId: %s", lib.CurrentProjectId)
 
 	// Check current plan
+	log.Printf("Debug: Checking current plan...")
 	if lib.CurrentPlanId == "" {
+		log.Printf("Debug: Plan resolution failed - CurrentPlanId is empty")
 		return fmt.Errorf("no current plan - run 'plandex new' to create a plan")
 	}
+	log.Printf("Debug: Plan OK - PlanId: %s", lib.CurrentPlanId)
 
-	// Verify model configuration by attempting to get plan config
-	_, err := api.Client.GetPlanConfig(lib.CurrentPlanId)
-	if err != nil {
-		return fmt.Errorf("plan not properly configured - ensure models are set up")
-	}
-
-	log.Printf("✅ CLI fully configured - Project: %s, Plan: %s", lib.CurrentProjectId, lib.CurrentPlanId)
+	log.Printf("Debug: CLI setup verification completed successfully")
 	return nil
 }
 
@@ -503,40 +505,56 @@ func (s *APIServer) executeJobAsync(job *Job, prompt string, isChatOnly, autoCon
 	}()
 }
 
-// executePlandexFunction calls plan_exec.TellPlan directly
+// executePlandexFunction calls the plandex CLI binary as a subprocess
 func (s *APIServer) executePlandexFunction(ctx context.Context, prompt string, isChatOnly, autoContext, autoApply bool) (map[string]interface{}, error) {
-	// Debug: Check environment variables
-	log.Printf("Debug: Environment variables during function execution:")
-	log.Printf("Debug: OPENAI_API_KEY present: %v", os.Getenv("OPENAI_API_KEY") != "")
-	log.Printf("Debug: LOCAL_MODE: %s", os.Getenv("LOCAL_MODE"))
-	log.Printf("Debug: PLANDEX_ENV: %s", os.Getenv("PLANDEX_ENV"))
-
-	// Prepare execution parameters
-	authVars := lib.MustVerifyAuthVarsSilent(auth.Current.IntegratedModelsMode)
-
-	params := plan_exec.ExecParams{
-		CurrentPlanId: lib.CurrentPlanId,
-		CurrentBranch: lib.CurrentBranch,
-		AuthVars:      authVars,
-		CheckOutdatedContext: func(maybeContexts []*shared.Context, projectPaths *types.ProjectPaths) (bool, bool, error) {
-			// For API mode, auto-handle outdated context
-			auto := autoContext || autoApply
-			return lib.CheckOutdatedContextWithOutput(auto, auto, maybeContexts, projectPaths)
-		},
+	log.Printf("Debug: Starting CLI subprocess execution")
+	
+	// Build the command
+	var args []string
+	if isChatOnly {
+		args = []string{"chat"}
+	} else {
+		args = []string{"tell"}
+		if autoApply {
+			args = append(args, "--apply")
+		}
 	}
-
-	// Configure tell flags
-	flags := types.TellFlags{
-		IsChatOnly:      isChatOnly,
-		AutoContext:     autoContext,
-		AutoApply:       autoApply,
-		SkipChangesMenu: true,        // Always skip interactive menus in API mode
-		ExecEnabled:     !isChatOnly, // Enable execution for tell, disable for chat
-		TellBg:          true,        // Run in background mode to avoid streaming UI
+	
+	// Use the working plandex binary
+	cmdStr := fmt.Sprintf("echo %q | /usr/local/bin/plandex %s", prompt, strings.Join(args, " "))
+	log.Printf("Debug: Executing command: %s", cmdStr)
+	
+	cmd := exec.CommandContext(ctx, "bash", "-c", cmdStr)
+	cmd.Dir = s.workingDir
+	
+	// Set environment variables
+	cmd.Env = append(os.Environ(),
+		"OPENAI_API_KEY="+os.Getenv("OPENAI_API_KEY"),
+		"PLANDEX_ENV="+os.Getenv("PLANDEX_ENV"),
+		"LOCAL_MODE="+os.Getenv("LOCAL_MODE"),
+		"HOME="+os.Getenv("HOME"),
+		"PLANDEX_API_MODE=1",
+		"PLANDEX_DISABLE_SPINNER=1",
+		"PLANDEX_DISABLE_COLORS=1",
+		"PLANDEX_SKIP_UPGRADE=1",
+		"TERM=dumb",
+		"NO_COLOR=1",
+	)
+	
+	// Disable stdin to prevent interactive prompts
+	cmd.Stdin = nil
+	
+	output, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			stderr := string(exitErr.Stderr)
+			log.Printf("Debug: CLI command failed with stderr: %s", stderr)
+			return nil, fmt.Errorf("plandex command failed: %v, stderr: %s", err, stderr)
+		}
+		return nil, fmt.Errorf("plandex command failed: %v", err)
 	}
-
-	// Call TellPlan directly
-	plan_exec.TellPlan(params, prompt, flags)
+	
+	log.Printf("Debug: CLI command completed successfully, output length: %d", len(output))
 
 	// Build result response
 	result := map[string]interface{}{
@@ -544,8 +562,7 @@ func (s *APIServer) executePlandexFunction(ctx context.Context, prompt string, i
 		"is_chat_only": isChatOnly,
 		"auto_context": autoContext,
 		"auto_apply":   autoApply,
-		"plan_id":      lib.CurrentPlanId,
-		"branch":       lib.CurrentBranch,
+		"output":       string(output),
 		"status":       "completed",
 	}
 

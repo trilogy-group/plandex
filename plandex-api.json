@@ -1,0 +1,39 @@
+{
+  "server": {
+    "port": 8080,
+    "host": "127.0.0.1",
+    "read_timeout": "30s",
+    "write_timeout": "30s",
+    "idle_timeout": "60s"
+  },
+  "auth": {
+    "api_keys": ["test-api-key-12345"],
+    "require_auth": true,
+    "token_lifetime": "24h"
+  },
+  "cli": {
+    "working_dir": ".",
+    "environment": {
+      "PLANDEX_ENV": "development"
+    },
+    "timeout": "10m"
+  },
+  "jobs": {
+    "max_concurrent": 5,
+    "default_ttl": "24h",
+    "cleanup_interval": "1h",
+    "max_history_size": 1000
+  },
+  "webhooks": {
+    "enabled": false,
+    "secret": "",
+    "max_retries": 3,
+    "retry_backoff": "30s"
+  },
+  "security": {
+    "enable_cors": true,
+    "allowed_origins": ["*"],
+    "rate_limit": 100,
+    "trusted_proxies": []
+  }
+} 
