@@ -7,19 +7,22 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/gorilla/mux"
+	"github.com/rs/cors"
+
 	"plandex-cli/api"
 	"plandex-cli/auth"
 	"plandex-cli/lib"
+	"plandex-cli/plan_exec"
+	"plandex-cli/types"
 
-	"github.com/gorilla/mux"
-	"github.com/rs/cors"
+	shared "plandex-shared"
 )
 
 // Config represents the server configuration
@@ -505,71 +508,48 @@ func (s *APIServer) executeJobAsync(job *Job, prompt string, isChatOnly, autoCon
 	}()
 }
 
-// executePlandexFunction calls the plandex CLI binary as a subprocess
+// executePlandexFunction calls plan_exec.TellPlan directly
 func (s *APIServer) executePlandexFunction(ctx context.Context, prompt string, isChatOnly, autoContext, autoApply bool) (map[string]interface{}, error) {
-	log.Printf("Debug: Starting CLI subprocess execution")
+	// Set environment variables to disable TTY/UI components
+	os.Setenv("PLANDEX_DISABLE_TUI", "1")
+	os.Setenv("PLANDEX_HEADLESS", "1") 
+	os.Setenv("PLANDEX_NON_INTERACTIVE", "1")
+	os.Setenv("CI", "true")
+	os.Setenv("TERM", "dumb")
+	os.Setenv("NO_COLOR", "1")
 	
-	// Create a temporary file with the prompt to avoid stdin issues
-	tmpFile, err := os.CreateTemp("", "plandex-prompt-*.txt")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temp file: %v", err)
+	log.Printf("Debug: Starting direct function execution")
+	
+	// Prepare execution parameters
+	authVars := lib.MustVerifyAuthVarsSilent(auth.Current.IntegratedModelsMode)
+
+	params := plan_exec.ExecParams{
+		CurrentPlanId: lib.CurrentPlanId,
+		CurrentBranch: lib.CurrentBranch,
+		AuthVars:      authVars,
+		CheckOutdatedContext: func(maybeContexts []*shared.Context, projectPaths *types.ProjectPaths) (bool, bool, error) {
+			// For API mode, auto-handle outdated context
+			auto := autoContext || autoApply
+			return lib.CheckOutdatedContextWithOutput(auto, auto, maybeContexts, projectPaths)
+		},
 	}
-	defer os.Remove(tmpFile.Name())
-	
-	if _, err := tmpFile.WriteString(prompt); err != nil {
-		return nil, fmt.Errorf("failed to write prompt to temp file: %v", err)
+
+	// Configure tell flags
+	flags := types.TellFlags{
+		IsChatOnly:      isChatOnly,
+		AutoContext:     autoContext,
+		AutoApply:       autoApply,
+		SkipChangesMenu: true,        // Always skip interactive menus in API mode
+		ExecEnabled:     !isChatOnly, // Enable execution for tell, disable for chat
+		TellBg:          true,        // Run in background mode to avoid streaming UI
 	}
-	tmpFile.Close()
-	
-	// Build the command with correct non-interactive flags
-	var args []string
-	if isChatOnly {
-		args = []string{"chat", "-f", tmpFile.Name(), "--stop"}
-	} else {
-		args = []string{"tell", "-f", tmpFile.Name(), "--bg"}
-		if autoApply {
-			args = append(args, "--apply")
-		}
-	}
-	
-	// Use the working plandex binary with proper non-interactive setup
-	cmdStr := fmt.Sprintf("/usr/local/bin/plandex %s", strings.Join(args, " "))
-	log.Printf("Debug: Executing command: %s", cmdStr)
-	
-	cmd := exec.CommandContext(ctx, "bash", "-c", cmdStr)
-	cmd.Dir = s.workingDir
-	
-	// Set environment variables to disable all interactive features
-	cmd.Env = append(os.Environ(),
-		"OPENAI_API_KEY="+os.Getenv("OPENAI_API_KEY"),
-		"PLANDEX_ENV="+os.Getenv("PLANDEX_ENV"),
-		"LOCAL_MODE="+os.Getenv("LOCAL_MODE"),
-		"HOME="+os.Getenv("HOME"),
-		"PLANDEX_API_MODE=1",
-		"PLANDEX_DISABLE_SPINNER=1",
-		"PLANDEX_DISABLE_COLORS=1",
-		"PLANDEX_SKIP_UPGRADE=1",
-		"PLANDEX_NO_STREAM=1",
-		"PLANDEX_NON_INTERACTIVE=1",
-		"TERM=dumb",
-		"NO_COLOR=1",
-		"CI=true",
-	)
-	
-	// Disable stdin completely
-	cmd.Stdin = nil
-	
-	output, err := cmd.Output()
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			stderr := string(exitErr.Stderr)
-			log.Printf("Debug: CLI command failed with stderr: %s", stderr)
-			return nil, fmt.Errorf("plandex command failed: %v, stderr: %s", err, stderr)
-		}
-		return nil, fmt.Errorf("plandex command failed: %v", err)
-	}
-	
-	log.Printf("Debug: CLI command completed successfully, output length: %d", len(output))
+
+	log.Printf("Debug: Calling TellPlan directly with flags: %+v", flags)
+
+	// Call TellPlan directly
+	plan_exec.TellPlan(params, prompt, flags)
+
+	log.Printf("Debug: TellPlan completed successfully")
 
 	// Build result response
 	result := map[string]interface{}{
@@ -577,7 +557,8 @@ func (s *APIServer) executePlandexFunction(ctx context.Context, prompt string, i
 		"is_chat_only": isChatOnly,
 		"auto_context": autoContext,
 		"auto_apply":   autoApply,
-		"output":       string(output),
+		"plan_id":      lib.CurrentPlanId,
+		"branch":       lib.CurrentBranch,
 		"status":       "completed",
 	}
 
