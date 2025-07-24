@@ -509,19 +509,31 @@ func (s *APIServer) executeJobAsync(job *Job, prompt string, isChatOnly, autoCon
 func (s *APIServer) executePlandexFunction(ctx context.Context, prompt string, isChatOnly, autoContext, autoApply bool) (map[string]interface{}, error) {
 	log.Printf("Debug: Starting CLI subprocess execution")
 	
-	// Build the command with non-interactive flags
+	// Create a temporary file with the prompt to avoid stdin issues
+	tmpFile, err := os.CreateTemp("", "plandex-prompt-*.txt")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	
+	if _, err := tmpFile.WriteString(prompt); err != nil {
+		return nil, fmt.Errorf("failed to write prompt to temp file: %v", err)
+	}
+	tmpFile.Close()
+	
+	// Build the command with correct non-interactive flags
 	var args []string
 	if isChatOnly {
-		args = []string{"chat", "--no-stream"}
+		args = []string{"chat", "-f", tmpFile.Name(), "--stop"}
 	} else {
-		args = []string{"tell", "--no-stream"}
+		args = []string{"tell", "-f", tmpFile.Name(), "--bg"}
 		if autoApply {
 			args = append(args, "--apply")
 		}
 	}
 	
 	// Use the working plandex binary with proper non-interactive setup
-	cmdStr := fmt.Sprintf("echo %q | /usr/local/bin/plandex %s", prompt, strings.Join(args, " "))
+	cmdStr := fmt.Sprintf("/usr/local/bin/plandex %s", strings.Join(args, " "))
 	log.Printf("Debug: Executing command: %s", cmdStr)
 	
 	cmd := exec.CommandContext(ctx, "bash", "-c", cmdStr)
@@ -544,7 +556,7 @@ func (s *APIServer) executePlandexFunction(ctx context.Context, prompt string, i
 		"CI=true",
 	)
 	
-	// Disable stdin and redirect to /dev/null to prevent any TTY access
+	// Disable stdin completely
 	cmd.Stdin = nil
 	
 	output, err := cmd.Output()
