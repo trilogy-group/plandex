@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"log"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"plandex-cli/fs"
 	"plandex-cli/lib"
 	"plandex-cli/plan_exec"
+	"plandex-cli/server"
 	"plandex-cli/term"
 	"plandex-cli/types"
 	"plandex-cli/ui"
@@ -61,6 +63,25 @@ func init() {
 }
 
 func main() {
+	// Check for API server mode
+	var serverMode bool
+	var configFile string
+
+	flag.BoolVar(&serverMode, "server", false, "Run as API server")
+	flag.StringVar(&configFile, "config", "", "Path to config file for server mode")
+	flag.Parse()
+
+	if serverMode {
+		// Run as API server
+		server.Start(configFile)
+		return
+	}
+
+	// Run as CLI (original behavior)
+	runCLI()
+}
+
+func runCLI() {
 	// Manually check for help flags at the root level
 	if len(os.Args) == 2 && (os.Args[1] == "-h" || os.Args[1] == "--help") {
 		// Display your custom help here
