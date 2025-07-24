@@ -25,3 +25,32 @@ __pycache__/
 __pycache__/
 
 .repo_ignore
+
+# CRITICAL SECURITY: Block all private keys and certificates
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+*.ppk
+
+# AWS credentials
+.aws/
+aws.json
+
+# API keys and secrets
+secrets/
+*.secret
+*_secret
+*-secret
+config/secrets.json
+
+# Additional security patterns
+.env.*
+*.env
