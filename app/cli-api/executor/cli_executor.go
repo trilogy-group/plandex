@@ -3,7 +3,6 @@ package executor
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"strings"
@@ -50,29 +49,22 @@ func (e *CLIExecutor) Execute(ctx context.Context, command string, args []string
 	cmdCtx, cancel := context.WithTimeout(ctx, e.timeout)
 	defer cancel()
 	
-	// Create temporary output file for non-interactive mode
-	tmpFile, err := ioutil.TempFile("", "plandex-output-*")
-	if err != nil {
-		return &ExecuteResult{Output: "", Error: err.Error(), ExitCode: 1}, err
+	// Build command arguments directly (avoid shell quoting issues)
+	var fullArgs []string
+	fullArgs = append(fullArgs, command)
+
+	// If command is "tell" add --bg for non-interactive background execution
+	if command == "tell" {
+		fullArgs = []string{"tell", "--bg"}
+		fullArgs = append(fullArgs, args...)
+	} else if command == "chat" {
+		// chat supports passing prompt as arg
+		fullArgs = []string{"chat"}
+		fullArgs = append(fullArgs, args...)
 	}
-	tmpPath := tmpFile.Name()
-	tmpFile.Close()
-	defer os.Remove(tmpPath)
-	
-	// Build command with properly quoted arguments
-	var cmdParts []string
-	cmdParts = append(cmdParts, shellQuote(command))
-	for _, arg := range args {
-		cmdParts = append(cmdParts, shellQuote(arg))
-	}
-	
-	// Build full command with proper environment sourcing and argument quoting
-	fullCmd := fmt.Sprintf("cd %s && echo 'n' | %s %s",
-		shellQuote(e.workingDir),
-		e.plandexBinary,
-		strings.Join(cmdParts, " "))
-	
-	cmd := exec.CommandContext(cmdCtx, "bash", "-c", fullCmd)
+
+	cmd := exec.CommandContext(cmdCtx, e.plandexBinary, fullArgs...)
+	cmd.Dir = e.workingDir
 	
 	// Set environment for non-interactive mode
 	env := os.Environ()
@@ -87,49 +79,34 @@ func (e *CLIExecutor) Execute(ctx context.Context, command string, args []string
 		env = append(env, fmt.Sprintf("%s=%s", key, value))
 	}
 	
-	// Add non-interactive mode variables
+	// Add non-interactive mode variables to disable TTY requirements
 	env = append(env,
-		"PLANDEX_REPL=1",                           // Enable REPL/batch mode
-		"PLANDEX_REPL_OUTPUT_FILE="+tmpPath,        // Output to file instead of TTY
-		"PLANDEX_SKIP_UPGRADE=1",                   // Skip upgrade prompts
-		"PLANDEX_DISABLE_SUGGESTIONS=1",            // Disable suggestions
-		"PLANDEX_COLUMNS=120",                      // Set terminal width
+		"PLANDEX_DISABLE_TTY=1",
+		"PLANDEX_NON_INTERACTIVE=1",
+		"TERM=dumb",
+		"NO_COLOR=1",
+		"PLANDEX_SKIP_UPGRADE=1",
 	)
-	
 	cmd.Env = env
-	
-	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	
-	err = cmd.Run()
-	
+
+	var outBuilder, errBuilder strings.Builder
+	cmd.Stdout = &outBuilder
+	cmd.Stderr = &errBuilder
+
+	runErr := cmd.Run()
+
 	exitCode := 0
-	if err != nil {
-		if exitError, ok := err.(*exec.ExitError); ok {
-			exitCode = exitError.ExitCode()
+	if runErr != nil {
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
 		} else {
 			exitCode = 1
 		}
 	}
-	
-	// Try to read from output file first (for interactive commands like chat)
-	output := stdout.String()
-	if fileContent, fileErr := ioutil.ReadFile(tmpPath); fileErr == nil && len(fileContent) > 0 {
-		output = string(fileContent)
-	}
-	
-	// Add stderr if any
-	if stderr.String() != "" {
-		if output != "" {
-			output += "\n"
-		}
-		output += stderr.String()
-	}
-	
+
 	return &ExecuteResult{
-		Output:   output,
-		Error:    stderr.String(),
+		Output:   outBuilder.String(),
+		Error:    errBuilder.String(),
 		ExitCode: exitCode,
-	}, nil
+	}, runErr
 }
